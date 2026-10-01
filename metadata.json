@@ -1,0 +1,6 @@
+{
+  "name": "MediaBolt - Video & Audio Downloader",
+  "description": "Modern, high-speed YouTube and TikTok video (watermark-free) and MP3 audio downloader with instant previews.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
