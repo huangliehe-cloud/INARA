@@ -198,9 +198,27 @@ export default function App() {
         videoPreviewUrl: `https://www.youtube.com/embed/${videoId}?autoplay=1`,
         formats: [
           {
-            id: 'yt-720p',
+            id: 'yt-1080',
+            label: 'MP4 Video (1080p Full HD)',
+            quality: '1080p Full HD',
+            ext: 'mp4',
+            type: 'video',
+            watermarkFree: true,
+            needsConversion: true
+          },
+          {
+            id: 'yt-720',
             label: 'MP4 Video (720p HD)',
             quality: '720p HD',
+            ext: 'mp4',
+            type: 'video',
+            watermarkFree: true,
+            needsConversion: true
+          },
+          {
+            id: 'yt-360',
+            label: 'MP4 Video (360p Cepat)',
+            quality: '360p Cepat (Fast)',
             ext: 'mp4',
             type: 'video',
             watermarkFree: true,
@@ -210,6 +228,15 @@ export default function App() {
             id: 'yt-mp3-320',
             label: 'MP3 Audio (320 kbps HQ)',
             quality: '320 kbps (HQ)',
+            ext: 'mp3',
+            type: 'audio',
+            watermarkFree: true,
+            needsConversion: true
+          },
+          {
+            id: 'yt-mp3-128',
+            label: 'MP3 Audio (128 kbps Cepat)',
+            quality: '128 kbps (Fast)',
             ext: 'mp3',
             type: 'audio',
             watermarkFree: true,
@@ -329,8 +356,15 @@ export default function App() {
           })
         });
 
-        const convData = await convRes.json();
-        if (!convRes.ok || !convData.success) {
+        const convContentType = convRes.headers.get('content-type') || '';
+        let convData: any = null;
+        if (convRes.ok && convContentType.includes('application/json')) {
+          convData = await convRes.json();
+        } else {
+          throw new Error('Server konversi sedang sibuk. Silakan coba pilih resolusi lain (misal: 720p / 360p / MP3).');
+        }
+
+        if (!convData.success) {
           throw new Error(convData.error || 'Server konversi sedang sibuk. Silakan coba kembali.');
         }
 
@@ -340,21 +374,49 @@ export default function App() {
           // Poll conversion progress until real media file is ready
           let isComplete = false;
           let attempts = 0;
-          const maxPollAttempts = 30;
+          const maxPollAttempts = 60; // up to 90s
 
           while (!isComplete && attempts < maxPollAttempts) {
             attempts++;
             await new Promise(r => setTimeout(r, 1500));
-            
-            try {
-              const checkRes = await fetch(`/api/check-download-progress?progressUrl=${encodeURIComponent(convData.progressUrl)}`);
-              const checkData = await checkRes.json();
 
-              if (checkData.progress) {
+            try {
+              let checkData: any = null;
+              // Try backend check first
+              try {
+                const checkRes = await fetch(`/api/check-download-progress?progressUrl=${encodeURIComponent(convData.progressUrl)}`);
+                if (checkRes.ok && checkRes.headers.get('content-type')?.includes('application/json')) {
+                  checkData = await checkRes.json();
+                }
+              } catch (e) {}
+
+              // Direct CORS fallback if backend didn't respond
+              if (!checkData) {
+                const directRes = await fetch(convData.progressUrl);
+                const directData = await directRes.json();
+                const ready = Boolean(
+                  (directData.download_url && directData.download_url.startsWith('http')) ||
+                  directData.success === 1 ||
+                  directData.text === 'Finished'
+                );
+                let prog = 40;
+                if (directData.progress >= 1000) prog = 100;
+                else if (directData.progress > 100) prog = Math.round(directData.progress / 10);
+                else if (directData.progress) prog = directData.progress;
+                if (ready && directData.download_url) prog = 100;
+
+                checkData = {
+                  isReady: ready && Boolean(directData.download_url),
+                  progress: prog,
+                  downloadUrl: directData.download_url || null
+                };
+              }
+
+              if (checkData?.progress) {
                 setDownloadProgressText(`Mengonversi ${format.ext.toUpperCase()} (${checkData.progress}%)...`);
               }
 
-              if (checkData.isReady && checkData.downloadUrl) {
+              if (checkData?.isReady && checkData.downloadUrl) {
                 finalUrl = checkData.downloadUrl;
                 isComplete = true;
                 break;
@@ -365,7 +427,7 @@ export default function App() {
           }
 
           if (!isComplete || !finalUrl) {
-            throw new Error('Proses konversi memerlukan waktu lebih lama. Silakan klik Download kembali untuk mengulang.');
+            throw new Error('Proses konversi memerlukan waktu lebih lama dari server YouTube. Silakan klik tombol Download kembali.');
           }
         }
       }
@@ -374,9 +436,7 @@ export default function App() {
         throw new Error('File belum siap. Silakan klik tombol Download kembali dalam beberapa detik.');
       }
 
-      setDownloadProgressText('Mendownload file media asli ke browser...');
-
-      // Build clean filename with MediaBolt tag to avoid opening old corrupted files in Downloads folder
+      // Build clean filename with MediaBolt tag
       const safeTitle = mediaInfo.title
         .replace(/[\u2018\u2019\u201C\u201D]/g, "'")
         .replace(/[/\\?%*:|"<>#]/g, '')
@@ -384,6 +444,42 @@ export default function App() {
         .trim();
       const ext = format.ext;
       const filename = `[MediaBolt] ${safeTitle || 'Media'}.${ext}`;
+
+      // DIRECT DOWNLOAD HANDLER:
+      // For YouTube conversions (savenow.to) or CDN streams, direct browser download avoids:
+      // 1. Vercel 4.5MB Serverless Function response limit
+      // 2. Browser JavaScript heap memory exhaustion from buffering 50MB blobs
+      // 3. Truncated or 0-byte corrupt files
+      if (format.needsConversion || finalUrl.includes('savenow.to') || finalUrl.includes('tikwm.com')) {
+        setDownloadProgressText('Mengirim file ke pengelola unduhan browser...');
+        const directLink = document.createElement('a');
+        directLink.href = finalUrl;
+        directLink.setAttribute('download', filename);
+        directLink.setAttribute('target', '_blank');
+        document.body.appendChild(directLink);
+        directLink.click();
+        document.body.removeChild(directLink);
+
+        // Record to history
+        saveToHistory({
+          id: `${mediaInfo.id}_${format.id}_${Date.now()}`,
+          title: filename,
+          thumbnail: mediaInfo.thumbnail,
+          platform: mediaInfo.platform,
+          formatLabel: `${format.label} (${format.quality})`,
+          ext: format.ext,
+          timestamp: Date.now(),
+          downloadUrl: finalUrl
+        });
+
+        setTimeout(() => {
+          setDownloadingId(null);
+          setDownloadProgressText('');
+        }, 2000);
+        return;
+      }
+
+      setDownloadProgressText('Mendownload file media asli ke browser...');
 
       const downloadProxyUrl = `/api/proxy-download?url=${encodeURIComponent(finalUrl)}&filename=${encodeURIComponent(filename)}`;
 

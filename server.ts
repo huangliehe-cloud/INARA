@@ -244,6 +244,15 @@ app.post('/api/fetch-info', async (req: Request, res: Response): Promise<void> =
           needsConversion: true
         },
         {
+          id: 'yt-360',
+          type: 'video' as const,
+          label: 'MP4 Video (360p Cepat)',
+          quality: '360p Cepat (Fast)',
+          ext: 'mp4' as const,
+          watermarkFree: true,
+          needsConversion: true
+        },
+        {
           id: 'yt-mp3-320',
           type: 'audio' as const,
           label: 'MP3 Audio (320 kbps HQ)',
@@ -307,6 +316,7 @@ app.post('/api/fetch-download', async (req: Request, res: Response): Promise<voi
     if (formatId === 'yt-1080') targetFormat = '1080';
     else if (formatId === 'yt-720') targetFormat = '720';
     else if (formatId === 'yt-480') targetFormat = '480';
+    else if (formatId === 'yt-360') targetFormat = '360';
     else if (formatId?.includes('mp3') || ext === 'mp3') targetFormat = 'mp3';
 
     const apiUrl = `https://loader.to/ajax/download.php?format=${targetFormat}&url=${encodeURIComponent(url)}`;
@@ -315,12 +325,12 @@ app.post('/api/fetch-download', async (req: Request, res: Response): Promise<voi
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Referer': 'https://loader.to/'
       },
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(8000)
     });
     const initData = await initRes.json();
 
     if (!initData.success) {
-      throw new Error(initData.text || 'Failed to start conversion.');
+      throw new Error(initData.text || 'Gagal memulai konversi. Silakan coba kembali.');
     }
 
     // If download_url is already available immediately and non-empty
@@ -335,62 +345,20 @@ app.post('/api/fetch-download', async (req: Request, res: Response): Promise<voi
 
     const progressUrl = initData.progress_url;
     if (!progressUrl) {
-      throw new Error('No progress tracker provided by conversion service.');
+      throw new Error('Server konversi tidak menyediakan tracker kemajuan.');
     }
 
-    // Poll progressUrl up to 10 attempts (every 1.5s)
-    let finalDownloadUrl: string | null = null;
-    let lastProgress = 0;
-
-    for (let attempts = 0; attempts < 10; attempts++) {
-      await new Promise(r => setTimeout(r, 1500));
-
-      try {
-        const progRes = await fetch(progressUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://loader.to/'
-          },
-          signal: AbortSignal.timeout(5000)
-        });
-        const progData = await progRes.json();
-
-        if (progData.progress) {
-          lastProgress = Math.min(Math.round(progData.progress / 10), 99);
-        }
-
-        if (progData.download_url && progData.download_url.startsWith('http')) {
-          finalDownloadUrl = progData.download_url;
-          break;
-        }
-
-        if (progData.text && progData.text.toLowerCase().includes('error')) {
-          throw new Error(progData.text);
-        }
-      } catch (pollErr: any) {
-        // Continue polling until timeout
-      }
-    }
-
-    if (finalDownloadUrl) {
-      res.json({
-        success: true,
-        downloadUrl: finalDownloadUrl,
-        title: initData.title
-      });
-    } else {
-      // Signal to frontend that conversion is ongoing with progressUrl so client can continue polling
-      res.json({
-        success: true,
-        isProgressPending: true,
-        progressUrl: progressUrl,
-        progress: lastProgress || 35,
-        title: initData.title
-      });
-    }
+    // Return immediately to avoid Vercel 10s Serverless timeout
+    res.json({
+      success: true,
+      isProgressPending: true,
+      progressUrl: progressUrl,
+      progress: 30,
+      title: initData.title
+    });
   } catch (err: any) {
     console.error('Fetch download error:', err.message);
-    res.status(500).json({ error: err.message || 'Unable to prepare download.' });
+    res.status(500).json({ error: err.message || 'Gagal menyiapkan konversi media.' });
   }
 });
 
@@ -411,18 +379,30 @@ app.get('/api/check-download-progress', async (req: Request, res: Response): Pro
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Referer': 'https://loader.to/'
       },
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(5000)
     });
 
     const progData = await progRes.json();
-    const isReady = Boolean(progData.download_url && progData.download_url.startsWith('http'));
+    const isReady = Boolean(
+      (progData.download_url && progData.download_url.startsWith('http')) ||
+      progData.success === 1 ||
+      progData.text === 'Finished'
+    );
+
+    let calculatedProgress = 40;
+    if (progData.progress) {
+      if (progData.progress >= 1000) calculatedProgress = 100;
+      else if (progData.progress > 100) calculatedProgress = Math.round(progData.progress / 10);
+      else calculatedProgress = progData.progress;
+    }
+    if (isReady && progData.download_url) calculatedProgress = 100;
 
     res.json({
       success: true,
       isReady,
-      progress: progData.progress ? Math.min(Math.round(progData.progress / 10), 100) : 50,
-      downloadUrl: isReady ? progData.download_url : null,
-      text: progData.text || 'Processing stream...'
+      progress: calculatedProgress,
+      downloadUrl: progData.download_url || null,
+      text: progData.text || 'Memproses konversi...'
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Progress check failed' });
