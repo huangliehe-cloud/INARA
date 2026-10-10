@@ -194,7 +194,7 @@ export default function App() {
         thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
         duration: 'HD',
         platform: 'youtube',
-        originalUrl: url,
+        originalUrl: `https://www.youtube.com/watch?v=${videoId}`,
         videoPreviewUrl: `https://www.youtube.com/embed/${videoId}?autoplay=1`,
         formats: [
           {
@@ -251,11 +251,15 @@ export default function App() {
 
   // Handle URL fetch submission
   const handleFetchMedia = async (targetUrl?: string) => {
-    const urlToFetch = (targetUrl || inputUrl).trim();
-    if (!urlToFetch) {
+    const rawUrl = (targetUrl || inputUrl).trim();
+    if (!rawUrl) {
       setErrorMsg('Silakan tempel tautan YouTube atau TikTok untuk melanjutkan.');
       return;
     }
+
+    // Auto-normalize YouTube URLs (strips ?si=..., tracking, and converts youtu.be to canonical watch?v=)
+    const ytMatch = rawUrl.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts|live)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
+    const urlToFetch = ytMatch ? `https://www.youtube.com/watch?v=${ytMatch[1]}` : rawUrl;
 
     setErrorMsg(null);
     setLoading(true);
@@ -346,31 +350,60 @@ export default function App() {
       // If YouTube format requires high-speed conversion
       if (format.needsConversion && (!finalUrl || finalUrl.includes('/api/progress'))) {
         setDownloadProgressText('Memulai konversi stream kualitas tinggi...');
-        const convRes = await fetch('/api/fetch-download', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: mediaInfo.originalUrl,
-            formatId: format.id,
-            ext: format.ext
-          })
-        });
-
-        const convContentType = convRes.headers.get('content-type') || '';
+        
         let convData: any = null;
-        if (convRes.ok && convContentType.includes('application/json')) {
-          convData = await convRes.json();
-        } else {
-          throw new Error('Server konversi sedang sibuk. Silakan coba pilih resolusi lain (misal: 720p / 360p / MP3).');
+
+        // Step 1: Attempt backend /api/fetch-download
+        try {
+          const convRes = await fetch('/api/fetch-download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              url: mediaInfo.originalUrl,
+              formatId: format.id,
+              ext: format.ext
+            })
+          });
+
+          const convContentType = convRes.headers.get('content-type') || '';
+          if (convRes.ok && convContentType.includes('application/json')) {
+            convData = await convRes.json();
+          }
+        } catch (backendErr) {
+          // Backend offline or error, continue to fallback
         }
 
-        if (!convData.success) {
-          throw new Error(convData.error || 'Server konversi sedang sibuk. Silakan coba kembali.');
+        // Step 2: Automatic client-side CORS fallback (works everywhere, including static Vercel)
+        if (!convData || !convData.success) {
+          setDownloadProgressText('Menghubungkan ke jalur konversi alternatif...');
+          let targetFmt = '1080';
+          if (format.id === 'yt-1080') targetFmt = '1080';
+          else if (format.id === 'yt-720') targetFmt = '720';
+          else if (format.id === 'yt-480') targetFmt = '480';
+          else if (format.id === 'yt-360') targetFmt = '360';
+          else if (format.id?.includes('mp3') || format.ext === 'mp3') targetFmt = 'mp3';
+
+          const targetApi = `https://loader.to/ajax/download.php?format=${targetFmt}&url=${encodeURIComponent(mediaInfo.originalUrl)}`;
+          try {
+            const fbRes = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(targetApi)}`);
+            convData = await fbRes.json();
+          } catch (fbErr) {
+            // If proxy fails, try direct loader.to
+            try {
+              const directLoader = await fetch(targetApi);
+              convData = await directLoader.json();
+            } catch (e) {}
+          }
+        }
+
+        if (!convData || !convData.success) {
+          throw new Error(convData?.text || 'Server konversi sedang sibuk. Silakan coba pilih format 360p atau MP3.');
         }
 
         if (convData.downloadUrl && convData.downloadUrl.startsWith('http')) {
           finalUrl = convData.downloadUrl;
-        } else if (convData.isProgressPending && convData.progressUrl) {
+        } else if (convData.progressUrl || convData.progress_url) {
+          const trackerUrl = convData.progressUrl || convData.progress_url;
           // Poll conversion progress until real media file is ready
           let isComplete = false;
           let attempts = 0;
@@ -384,7 +417,7 @@ export default function App() {
               let checkData: any = null;
               // Try backend check first
               try {
-                const checkRes = await fetch(`/api/check-download-progress?progressUrl=${encodeURIComponent(convData.progressUrl)}`);
+                const checkRes = await fetch(`/api/check-download-progress?progressUrl=${encodeURIComponent(trackerUrl)}`);
                 if (checkRes.ok && checkRes.headers.get('content-type')?.includes('application/json')) {
                   checkData = await checkRes.json();
                 }
@@ -392,7 +425,7 @@ export default function App() {
 
               // Direct CORS fallback if backend didn't respond
               if (!checkData) {
-                const directRes = await fetch(convData.progressUrl);
+                const directRes = await fetch(trackerUrl);
                 const directData = await directRes.json();
                 const ready = Boolean(
                   (directData.download_url && directData.download_url.startsWith('http')) ||
@@ -445,117 +478,53 @@ export default function App() {
       const ext = format.ext;
       const filename = `[MediaBolt] ${safeTitle || 'Media'}.${ext}`;
 
-      // DIRECT DOWNLOAD HANDLER:
-      // For YouTube conversions (savenow.to) or CDN streams, direct browser download avoids:
-      // 1. Vercel 4.5MB Serverless Function response limit
-      // 2. Browser JavaScript heap memory exhaustion from buffering 50MB blobs
-      // 3. Truncated or 0-byte corrupt files
-      if (format.needsConversion || finalUrl.includes('savenow.to') || finalUrl.includes('tikwm.com')) {
-        setDownloadProgressText('Mengirim file ke pengelola unduhan browser...');
-        const directLink = document.createElement('a');
-        directLink.href = finalUrl;
-        directLink.setAttribute('download', filename);
-        directLink.setAttribute('target', '_blank');
-        document.body.appendChild(directLink);
-        directLink.click();
-        document.body.removeChild(directLink);
-
-        // Record to history
-        saveToHistory({
-          id: `${mediaInfo.id}_${format.id}_${Date.now()}`,
-          title: filename,
-          thumbnail: mediaInfo.thumbnail,
-          platform: mediaInfo.platform,
-          formatLabel: `${format.label} (${format.quality})`,
-          ext: format.ext,
-          timestamp: Date.now(),
-          downloadUrl: finalUrl
-        });
-
-        setTimeout(() => {
-          setDownloadingId(null);
-          setDownloadProgressText('');
-        }, 2000);
-        return;
-      }
-
-      setDownloadProgressText('Mendownload file media asli ke browser...');
+      setDownloadProgressText('Mendownload file media ke perangkat...');
 
       const downloadProxyUrl = `/api/proxy-download?url=${encodeURIComponent(finalUrl)}&filename=${encodeURIComponent(filename)}`;
 
-      // Fetch the binary stream with live progress and build a Blob
-      let fileRes: Response | null = null;
+      let blobData: Blob | null = null;
+
+      // Primary strategy: Fetch via proxy with proper upstream headers (Referer/User-Agent)
       try {
-        fileRes = await fetch(downloadProxyUrl);
-        const contentType = fileRes.headers.get('content-type') || '';
-        if (!fileRes.ok || contentType.includes('text/html')) {
-          throw new Error('Proxy not available or returned HTML');
+        setDownloadProgressText(`Mengambil file ${format.ext.toUpperCase()}...`);
+        const pRes = await fetch(downloadProxyUrl);
+        const pType = pRes.headers.get('content-type') || '';
+        if (pRes.ok && !pType.includes('text/html') && !pType.includes('application/json')) {
+          blobData = await pRes.blob();
         }
-      } catch (fetchErr) {
-        // Fallback: trigger direct download using finalUrl if proxy returned error / 404
-        const directUrl = (finalUrl && finalUrl.startsWith('http')) ? finalUrl : downloadProxyUrl;
-        const fallbackLink = document.createElement('a');
-        fallbackLink.href = directUrl;
-        fallbackLink.setAttribute('download', filename);
-        fallbackLink.setAttribute('target', '_blank');
-        document.body.appendChild(fallbackLink);
-        fallbackLink.click();
-        document.body.removeChild(fallbackLink);
-        setDownloadProgressText('Mengalihkan unduhan langsung ke browser...');
-        setTimeout(() => {
-          setDownloadingId(null);
-          setDownloadProgressText('');
-        }, 2500);
-        return;
-      }
+      } catch (e) {}
 
-      const contentLengthHeader = fileRes.headers.get('content-length');
-      const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
-      
-      const reader = fileRes.body?.getReader();
-      if (!reader) {
-        throw new Error('ReadableStream tidak didukung di browser ini.');
-      }
-
-      const chunks: BlobPart[] = [];
-      let receivedBytes = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          chunks.push(value);
-          receivedBytes += value.length;
-          const mbReceived = (receivedBytes / (1024 * 1024)).toFixed(1);
-          if (totalBytes > 0) {
-            const mbTotal = (totalBytes / (1024 * 1024)).toFixed(1);
-            const pct = Math.round((receivedBytes / totalBytes) * 100);
-            setDownloadProgressText(`Mengunduh: ${mbReceived} MB / ${mbTotal} MB (${pct}%)...`);
-          } else {
-            setDownloadProgressText(`Mengunduh: ${mbReceived} MB...`);
+      // Secondary strategy: Direct browser fetch to finalUrl (CORS enabled, avoid browser page navigation)
+      if (!blobData || blobData.size < 5000) {
+        try {
+          setDownloadProgressText(`Mengunduh stream langsung...`);
+          const dRes = await fetch(finalUrl);
+          const dType = dRes.headers.get('content-type') || '';
+          if (dRes.ok && !dType.includes('text/html')) {
+            blobData = await dRes.blob();
           }
-        }
+        } catch (e) {}
       }
 
-      // Validate downloaded blob size
-      if (receivedBytes < 20000) {
-        throw new Error('Ukuran file yang diterima terlalu kecil atau belum selesai dirender. Silakan coba kembali.');
+      if (!blobData || blobData.size < 5000) {
+        throw new Error('Gagal mengunduh file media. File belum siap atau server sedang sibuk, silakan coba beberapa detik lagi.');
       }
 
-      const mimeType = ext === 'mp4' ? 'video/mp4' : 'audio/mpeg';
-      const blob = new Blob(chunks, { type: mimeType });
-      const objectUrl = URL.createObjectURL(blob);
+      // Convert to clean local ObjectURL and trigger browser file save
+      // This strictly prevents page navigation, screen going dark, and AdEx captcha!
+      const mimeType = format.ext === 'mp4' ? 'video/mp4' : 'audio/mpeg';
+      const fileBlob = new Blob([blobData], { type: mimeType });
+      const objectUrl = URL.createObjectURL(fileBlob);
 
       setDownloadProgressText('Menyimpan file ke perangkat Anda...');
 
-      const link = document.createElement('a');
-      link.href = objectUrl;
-      link.setAttribute('download', filename);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      const downloadLink = document.createElement('a');
+      downloadLink.href = objectUrl;
+      downloadLink.download = filename;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      document.body.removeChild(downloadLink);
 
-      // Clean up object URL after a brief delay
       setTimeout(() => {
         URL.revokeObjectURL(objectUrl);
       }, 30000);
@@ -566,7 +535,7 @@ export default function App() {
         title: filename,
         thumbnail: mediaInfo.thumbnail,
         platform: mediaInfo.platform,
-        formatLabel: `${format.label} (${(receivedBytes / (1024 * 1024)).toFixed(1)} MB)`,
+        formatLabel: `${format.label} (${(fileBlob.size / (1024 * 1024)).toFixed(1)} MB)`,
         ext: format.ext,
         timestamp: Date.now(),
         downloadUrl: downloadProxyUrl
@@ -576,7 +545,8 @@ export default function App() {
       setTimeout(() => {
         setDownloadingId(null);
         setDownloadProgressText('');
-      }, 2500);
+      }, 2000);
+      return;
     } catch (err: any) {
       setErrorMsg(err.message || 'Gagal mengunduh file. Silakan coba kualitas lain.');
       setDownloadingId(null);
@@ -958,10 +928,20 @@ export default function App() {
                     Close
                   </button>
                 </div>
-                {mediaInfo.videoPreviewUrl && activeTab !== 'audio' ? (
+                {mediaInfo.platform === 'youtube' ? (
+                  <div className="aspect-video w-full max-h-96 rounded-lg overflow-hidden bg-black border border-slate-800">
+                    <iframe
+                      src={`https://www.youtube-nocookie.com/embed/${mediaInfo.id}?autoplay=1&rel=0`}
+                      title={mediaInfo.title}
+                      className="w-full h-full border-0"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                    />
+                  </div>
+                ) : mediaInfo.videoPreviewUrl && activeTab !== 'audio' ? (
                   <video
                     ref={videoRef}
-                    src={`/api/proxy-download?url=${encodeURIComponent(mediaInfo.videoPreviewUrl)}&stream=1&filename=preview.mp4`}
+                    src={mediaInfo.videoPreviewUrl}
                     controls
                     autoPlay
                     playsInline
@@ -975,7 +955,7 @@ export default function App() {
                     </p>
                     <audio
                       ref={audioRef}
-                      src={`/api/proxy-download?url=${encodeURIComponent(mediaInfo.audioPreviewUrl || mediaInfo.videoPreviewUrl || '')}&stream=1&filename=preview.mp3`}
+                      src={mediaInfo.audioPreviewUrl || mediaInfo.videoPreviewUrl || ''}
                       controls
                       autoPlay
                       className="w-full max-w-lg"

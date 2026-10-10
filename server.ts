@@ -311,6 +311,10 @@ app.post('/api/fetch-download', async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    // Always sanitize and extract YouTube video ID into clean canonical URL
+    const ytId = extractYouTubeId(url);
+    const cleanUrl = ytId ? `https://www.youtube.com/watch?v=${ytId}` : url;
+
     // Map formatId to API format
     let targetFormat = '1080';
     if (formatId === 'yt-1080') targetFormat = '1080';
@@ -319,7 +323,7 @@ app.post('/api/fetch-download', async (req: Request, res: Response): Promise<voi
     else if (formatId === 'yt-360') targetFormat = '360';
     else if (formatId?.includes('mp3') || ext === 'mp3') targetFormat = 'mp3';
 
-    const apiUrl = `https://loader.to/ajax/download.php?format=${targetFormat}&url=${encodeURIComponent(url)}`;
+    const apiUrl = `https://loader.to/ajax/download.php?format=${targetFormat}&url=${encodeURIComponent(cleanUrl)}`;
     const initRes = await fetch(apiUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
