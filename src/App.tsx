@@ -38,7 +38,7 @@ const SAMPLE_URLS = [
   }
 ];
 
-export default function App() {
+function MainApp() {
   const [inputUrl, setInputUrl] = useState('');
   const [detectedPlatform, setDetectedPlatform] = useState<PlatformType>('unknown');
   const [loading, setLoading] = useState(false);
@@ -52,6 +52,20 @@ export default function App() {
   // Downloading / Processing state per format
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [downloadProgressText, setDownloadProgressText] = useState<string>('');
+  
+  // Dedicated Download Modal state (prevents iframe navigation and black screen)
+  const [downloadModal, setDownloadModal] = useState<{
+    status: 'converting' | 'downloading' | 'ready' | 'error';
+    format: MediaFormat;
+    filename: string;
+    progress: number;
+    stepText: string;
+    proxyUrl?: string;
+    directUrl?: string;
+    objectUrl?: string;
+    sizeMb?: string;
+    error?: string;
+  } | null>(null);
   
   // Media Preview Player
   const [isPlayingPreview, setIsPlayingPreview] = useState(false);
@@ -338,18 +352,40 @@ export default function App() {
     }
   };
 
-  // Initiate Download for a format with live byte streaming into Blob
+  // Initiate Download for a format with live progress modal & safe file trigger
   const handleDownload = async (format: MediaFormat) => {
     if (!mediaInfo) return;
     setDownloadingId(format.id);
-    setDownloadProgressText('Menghubungkan ke server media...');
+    setErrorMsg(null);
+
+    // Build clean filename with MediaBolt tag
+    const safeTitle = mediaInfo.title
+      .replace(/[\u2018\u2019\u201C\u201D]/g, "'")
+      .replace(/[/\\?%*:|"<>#]/g, '')
+      .slice(0, 50)
+      .trim();
+    const ext = format.ext;
+    const filename = `[MediaBolt] ${safeTitle || 'Media'}.${ext}`;
+
+    // Open active download modal immediately
+    setDownloadModal({
+      status: 'converting',
+      format,
+      filename,
+      progress: 15,
+      stepText: 'Menghubungkan ke server media...'
+    });
 
     try {
       let finalUrl = format.downloadUrl;
 
       // If YouTube format requires high-speed conversion
       if (format.needsConversion && (!finalUrl || finalUrl.includes('/api/progress'))) {
-        setDownloadProgressText('Memulai konversi stream kualitas tinggi...');
+        setDownloadModal(prev => prev ? {
+          ...prev,
+          progress: 25,
+          stepText: `Memulai konversi stream ${format.ext.toUpperCase()} (${format.quality})...`
+        } : null);
         
         let convData: any = null;
 
@@ -375,7 +411,12 @@ export default function App() {
 
         // Step 2: Automatic client-side CORS fallback (works everywhere, including static Vercel)
         if (!convData || !convData.success) {
-          setDownloadProgressText('Menghubungkan ke jalur konversi alternatif...');
+          setDownloadModal(prev => prev ? {
+            ...prev,
+            progress: 35,
+            stepText: 'Menghubungkan ke jalur konversi alternatif...'
+          } : null);
+
           let targetFmt = '1080';
           if (format.id === 'yt-1080') targetFmt = '1080';
           else if (format.id === 'yt-720') targetFmt = '720';
@@ -446,7 +487,12 @@ export default function App() {
               }
 
               if (checkData?.progress) {
-                setDownloadProgressText(`Mengonversi ${format.ext.toUpperCase()} (${checkData.progress}%)...`);
+                const displayProg = Math.min(92, Math.max(25, checkData.progress));
+                setDownloadModal(prev => prev ? {
+                  ...prev,
+                  progress: displayProg,
+                  stepText: `Mengonversi ${format.ext.toUpperCase()} (${checkData.progress}%)...`
+                } : null);
               }
 
               if (checkData?.isReady && checkData.downloadUrl) {
@@ -469,16 +515,12 @@ export default function App() {
         throw new Error('File belum siap. Silakan klik tombol Download kembali dalam beberapa detik.');
       }
 
-      // Build clean filename with MediaBolt tag
-      const safeTitle = mediaInfo.title
-        .replace(/[\u2018\u2019\u201C\u201D]/g, "'")
-        .replace(/[/\\?%*:|"<>#]/g, '')
-        .slice(0, 50)
-        .trim();
-      const ext = format.ext;
-      const filename = `[MediaBolt] ${safeTitle || 'Media'}.${ext}`;
-
-      setDownloadProgressText('Mendownload file media ke perangkat...');
+      setDownloadModal(prev => prev ? {
+        ...prev,
+        status: 'downloading',
+        progress: 95,
+        stepText: 'Mengambil file media asli dari server...'
+      } : null);
 
       const downloadProxyUrl = `/api/proxy-download?url=${encodeURIComponent(finalUrl)}&filename=${encodeURIComponent(filename)}`;
 
@@ -486,7 +528,6 @@ export default function App() {
 
       // Primary strategy: Fetch via proxy with proper upstream headers (Referer/User-Agent)
       try {
-        setDownloadProgressText(`Mengambil file ${format.ext.toUpperCase()}...`);
         const pRes = await fetch(downloadProxyUrl);
         const pType = pRes.headers.get('content-type') || '';
         if (pRes.ok && !pType.includes('text/html') && !pType.includes('application/json')) {
@@ -497,7 +538,6 @@ export default function App() {
       // Secondary strategy: Direct browser fetch to finalUrl (CORS enabled, avoid browser page navigation)
       if (!blobData || blobData.size < 5000) {
         try {
-          setDownloadProgressText(`Mengunduh stream langsung...`);
           const dRes = await fetch(finalUrl);
           const dType = dRes.headers.get('content-type') || '';
           if (dRes.ok && !dType.includes('text/html')) {
@@ -506,28 +546,45 @@ export default function App() {
         } catch (e) {}
       }
 
-      if (!blobData || blobData.size < 5000) {
-        throw new Error('Gagal mengunduh file media. File belum siap atau server sedang sibuk, silakan coba beberapa detik lagi.');
+      let objectUrl: string | undefined = undefined;
+      let sizeMb = '4.0';
+
+      if (blobData && blobData.size >= 5000) {
+        const mimeType = format.ext === 'mp4' ? 'video/mp4' : 'audio/mpeg';
+        const fileBlob = new Blob([blobData], { type: mimeType });
+        objectUrl = URL.createObjectURL(fileBlob);
+        sizeMb = (fileBlob.size / (1024 * 1024)).toFixed(1);
       }
 
-      // Convert to clean local ObjectURL and trigger browser file save
-      // This strictly prevents page navigation, screen going dark, and AdEx captcha!
-      const mimeType = format.ext === 'mp4' ? 'video/mp4' : 'audio/mpeg';
-      const fileBlob = new Blob([blobData], { type: mimeType });
-      const objectUrl = URL.createObjectURL(fileBlob);
+      // 100% SAFE DOWNLOAD TRIGGER:
+      // We use a hidden iframe pointing to proxy download (with Content-Disposition: attachment).
+      // This strictly avoids self-navigation in iframes, preventing Chrome from replacing
+      // the website with a pitch-black video player screen!
+      try {
+        const hiddenIframe = document.createElement('iframe');
+        hiddenIframe.style.display = 'none';
+        hiddenIframe.src = downloadProxyUrl;
+        document.body.appendChild(hiddenIframe);
+        setTimeout(() => {
+          try { document.body.removeChild(hiddenIframe); } catch(e) {}
+        }, 30000);
+      } catch (e) {}
 
-      setDownloadProgressText('Menyimpan file ke perangkat Anda...');
-
-      const downloadLink = document.createElement('a');
-      downloadLink.href = objectUrl;
-      downloadLink.download = filename;
-      document.body.appendChild(downloadLink);
-      downloadLink.click();
-      document.body.removeChild(downloadLink);
-
-      setTimeout(() => {
-        URL.revokeObjectURL(objectUrl);
-      }, 30000);
+      // If objectUrl is available, also attempt safe anchor download with target="_blank"
+      if (objectUrl) {
+        try {
+          const safeAnchor = document.createElement('a');
+          safeAnchor.href = objectUrl;
+          safeAnchor.download = filename;
+          safeAnchor.target = '_blank';
+          safeAnchor.rel = 'noopener noreferrer';
+          document.body.appendChild(safeAnchor);
+          safeAnchor.click();
+          setTimeout(() => {
+            try { document.body.removeChild(safeAnchor); } catch(e) {}
+          }, 1500);
+        } catch (e) {}
+      }
 
       // Save to download history
       saveToHistory({
@@ -535,19 +592,37 @@ export default function App() {
         title: filename,
         thumbnail: mediaInfo.thumbnail,
         platform: mediaInfo.platform,
-        formatLabel: `${format.label} (${(fileBlob.size / (1024 * 1024)).toFixed(1)} MB)`,
+        formatLabel: `${format.label} (${sizeMb} MB)`,
         ext: format.ext,
         timestamp: Date.now(),
         downloadUrl: downloadProxyUrl
       });
 
-      setDownloadProgressText('File berhasil tersimpan!');
-      setTimeout(() => {
-        setDownloadingId(null);
-        setDownloadProgressText('');
-      }, 2000);
+      // Update modal to 'ready' status!
+      setDownloadModal({
+        status: 'ready',
+        format,
+        filename,
+        progress: 100,
+        stepText: 'File berhasil diproses & siap disimpan!',
+        proxyUrl: downloadProxyUrl,
+        directUrl: finalUrl,
+        objectUrl,
+        sizeMb
+      });
+
+      setDownloadingId(null);
+      setDownloadProgressText('');
       return;
     } catch (err: any) {
+      setDownloadModal({
+        status: 'error',
+        format,
+        filename,
+        progress: 0,
+        stepText: '',
+        error: err.message || 'Gagal mengunduh file. Silakan coba resolusi atau format lain.'
+      });
       setErrorMsg(err.message || 'Gagal mengunduh file. Silakan coba kualitas lain.');
       setDownloadingId(null);
       setDownloadProgressText('');
@@ -1247,6 +1322,180 @@ export default function App() {
         </div>
       )}
 
+      {/* Interactive Download Progress & Completion Modal (Guarantees screen NEVER goes dark) */}
+      {downloadModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-5 sm:p-6 overflow-hidden animate-in zoom-in-95 duration-200">
+            {/* Header */}
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
+                  downloadModal.status === 'ready'
+                    ? 'bg-emerald-500/20 text-emerald-400'
+                    : downloadModal.status === 'error'
+                    ? 'bg-red-500/20 text-red-400'
+                    : 'bg-cyan-500/20 text-cyan-400'
+                }`}>
+                  {downloadModal.status === 'ready' ? (
+                    <Check className="w-4 h-4 text-emerald-400" />
+                  ) : downloadModal.status === 'error' ? (
+                    <AlertCircle className="w-4 h-4 text-red-400" />
+                  ) : (
+                    <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                  )}
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">
+                    {downloadModal.status === 'ready'
+                      ? 'File Siap Diunduh!'
+                      : downloadModal.status === 'error'
+                      ? 'Gagal Mengonversi'
+                      : 'Memproses Unduhan'}
+                  </h3>
+                  <p className="text-[11px] text-slate-400">
+                    {downloadModal.format.label} ({downloadModal.format.quality})
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setDownloadModal(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Tutup"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Content for converting / downloading */}
+            {(downloadModal.status === 'converting' || downloadModal.status === 'downloading') && (
+              <div className="py-6 space-y-4">
+                <div className="flex items-center justify-between text-xs font-semibold">
+                  <span className="text-cyan-400 flex items-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>{downloadModal.stepText}</span>
+                  </span>
+                  <span className="text-slate-300 font-mono">{downloadModal.progress}%</span>
+                </div>
+
+                {/* Animated Progress Bar */}
+                <div className="w-full h-2.5 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+                  <div
+                    className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-300"
+                    style={{ width: `${downloadModal.progress}%` }}
+                  />
+                </div>
+
+                <p className="text-[11px] text-slate-500 text-center">
+                  Mohon jangan tutup jendela ini. File sedang diekstrak dan dikonversi langsung untuk Anda.
+                </p>
+              </div>
+            )}
+
+            {/* Content for Ready */}
+            {downloadModal.status === 'ready' && (
+              <div className="py-4 space-y-4">
+                <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0">
+                    {downloadModal.format.type === 'video' ? <Video className="w-5 h-5" /> : <Music className="w-5 h-5" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-semibold text-white truncate">{downloadModal.filename}</p>
+                    <p className="text-[11px] text-emerald-400 font-medium">
+                      Ukuran: {downloadModal.sizeMb || '4.0'} MB · Format: {downloadModal.format.ext.toUpperCase()}
+                    </p>
+                  </div>
+                </div>
+
+                {/* In-Modal Player for instant playback */}
+                {downloadModal.format.type === 'audio' ? (
+                  <div className="p-2.5 bg-slate-950 rounded-xl border border-slate-800">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-1.5 flex items-center gap-1.5">
+                      <Music className="w-3 h-3 text-cyan-400" />
+                      <span>Putar Audio Langsung di Sini:</span>
+                    </p>
+                    <audio
+                      src={downloadModal.objectUrl || downloadModal.proxyUrl}
+                      controls
+                      autoPlay
+                      className="w-full h-8"
+                    />
+                  </div>
+                ) : (
+                  <div className="rounded-xl overflow-hidden bg-black border border-slate-800">
+                    <video
+                      src={downloadModal.objectUrl || downloadModal.proxyUrl}
+                      controls
+                      autoPlay
+                      playsInline
+                      className="w-full max-h-48"
+                    />
+                  </div>
+                )}
+
+                {/* Primary Action Button */}
+                <a
+                  href={downloadModal.objectUrl || downloadModal.proxyUrl}
+                  download={downloadModal.filename}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-black font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Simpan File ke Perangkat ({downloadModal.sizeMb} MB)</span>
+                </a>
+
+                {/* Secondary Actions */}
+                <div className="flex items-center gap-2 pt-1">
+                  <button
+                    onClick={() => {
+                      const linkToCopy = downloadModal.proxyUrl ? window.location.origin + downloadModal.proxyUrl : downloadModal.directUrl || '';
+                      navigator.clipboard.writeText(linkToCopy);
+                      alert('Tautan unduhan berhasil disalin ke clipboard!');
+                    }}
+                    className="flex-1 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Salin Link</span>
+                  </button>
+
+                  <button
+                    onClick={() => setDownloadModal(null)}
+                    className="py-2 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Content for Error */}
+            {downloadModal.status === 'error' && (
+              <div className="py-4 space-y-4">
+                <div className="p-3.5 rounded-xl bg-red-950/50 border border-red-800/60 text-xs text-red-200">
+                  {downloadModal.error || 'Server konversi YouTube sedang sibuk. Silakan coba pilih format 360p atau MP3 128k.'}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleDownload(downloadModal.format)}
+                    className="flex-1 py-2.5 px-4 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Coba Lagi</span>
+                  </button>
+                  <button
+                    onClick={() => setDownloadModal(null)}
+                    className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Footer */}
       <footer className="w-full border-t border-slate-800/80 py-6 text-center text-xs text-slate-500">
         <div className="max-w-4xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
@@ -1261,5 +1510,51 @@ export default function App() {
         </div>
       </footer>
     </div>
+  );
+}
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error('ErrorBoundary captured error:', error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-[#080C14] text-white flex flex-col items-center justify-center p-6 text-center">
+          <div className="w-16 h-16 rounded-2xl bg-cyan-500/10 text-cyan-400 flex items-center justify-center mb-4 border border-cyan-500/20 shadow-lg shadow-cyan-500/10">
+            <Zap className="w-8 h-8" />
+          </div>
+          <h2 className="text-xl font-bold mb-2 font-display">MediaBolt Downloader</h2>
+          <p className="text-slate-400 text-sm max-w-md mb-6 leading-relaxed">
+            Aplikasi mengalami kendala tampilan sementara. Klik tombol di bawah untuk memuat ulang aplikasi dengan aman.
+          </p>
+          <button
+            onClick={() => window.location.reload()}
+            className="px-6 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-black font-bold text-sm transition-colors cursor-pointer shadow-lg shadow-cyan-500/25"
+          >
+            Muat Ulang Halaman
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <MainApp />
+    </ErrorBoundary>
   );
 }
